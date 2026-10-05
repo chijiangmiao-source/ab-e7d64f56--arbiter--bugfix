@@ -120,5 +120,95 @@ class TestService(unittest.TestCase):
                          {"first": [1], "second": [2]})
 
 
+class SharedVolumeHarness:
+    """Two arbiter HTTP instances initialized on one shared store file."""
+
+    def __init__(self):
+        import socket
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store_path = os.path.join(self.tmp.name, "sealed.json")
+        self.servers = []
+        self.threads = []
+        self.bases = []
+        for _ in range(2):
+            store = SealedStore(self.store_path)
+            httpd, _ = make_server("127.0.0.1", 0, store)
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            self.servers.append(httpd)
+            self.threads.append(thread)
+            self.bases.append(f"http://127.0.0.1:{port}")
+
+    def stop(self):
+        for httpd in self.servers:
+            httpd.shutdown()
+            httpd.server_close()
+        self.tmp.cleanup()
+
+
+def _post(base, payload):
+    req = urllib.request.Request(
+        base + "/api/v1/analyze",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _get(base, path):
+    with urllib.request.urlopen(base + path, timeout=5) as r:
+        return r.status, json.loads(r.read())
+
+
+class TestSharedVolumeConflict(unittest.TestCase):
+    """Regression: duplicate seals over a shared file lose first evidence."""
+
+    def setUp(self):
+        self.h = SharedVolumeHarness()
+
+    def tearDown(self):
+        self.h.stop()
+
+    def test_peer_conflict_keeps_first_evidence(self):
+        base_a, base_b = self.h.bases
+        first = {
+            "audit_id": "shared-audit", "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["a"]}],
+            "start": "S", "tokens": ["a"],
+        }
+        s, b = _post(base_a, first)
+        self.assertEqual((s, b["seal_status"]), (200, "SEALED"))
+        self.assertEqual(b["result"]["production_sequence"], [1])
+
+        # Instance B was initialized before A sealed and never reloaded;
+        # its semantically different submission must be refused.
+        other = dict(first)
+        other["productions"] = [{"id": 1, "lhs": "S", "rhs": ["b"]}]
+        other["tokens"] = ["b"]
+        s, b = _post(base_b, other)
+        self.assertEqual(s, 409)
+        self.assertEqual(b["error"], "AUDIT_ID_CONFLICT")
+        self.assertEqual(
+            b["original_evidence"]["conclusion"]["production_sequence"], [1])
+
+        # Rereading by id from BOTH instances yields A's first evidence.
+        for base in (base_a, base_b):
+            s, b = _get(base, "/api/v1/conclusion/shared-audit")
+            self.assertEqual(s, 200)
+            conclusion = b["conclusion"]
+            self.assertEqual(conclusion["verdict"], "UNIQUE_ACCEPTED")
+            self.assertEqual(conclusion["tree"]["children"][0]["token"], "a")
+            self.assertEqual(conclusion["production_sequence"], [1])
+
+        # An equivalent retransmission via B replays A's evidence.
+        s, b = _post(base_b, first)
+        self.assertEqual((s, b["seal_status"]), (200, "REPLAYED"))
+        self.assertEqual(b["result"]["tree"]["children"][0]["token"], "a")
+
+
 if __name__ == "__main__":
     unittest.main()

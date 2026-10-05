@@ -9,7 +9,9 @@ Order of operations (mirrors the acceptance contract):
 3. HTTP smoke against the running arbiter:
    unique acceptance, ambiguous acceptance with two stable trees,
    non-consuming-cycle rejection, equivalent retransmission replay,
-   audit-id conflict preserving the original evidence.
+   audit-id conflict preserving the original evidence,
+   two arbiter instances sharing one sealed volume (rolling-deploy
+   duplicate seal must conflict and keep the first evidence).
 
 Exits 0 only when every step passes; any failure exits 1.
 """
@@ -18,7 +20,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -43,10 +47,10 @@ def check(cond, msg):
         failures.append(msg)
 
 
-def http_post(path, payload):
+def http_post(path, payload, base=None):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        BASE_URL + path, data=data,
+        (base or BASE_URL) + path, data=data,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -55,26 +59,191 @@ def http_post(path, payload):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-def http_get(path):
-    with urllib.request.urlopen(BASE_URL + path, timeout=10) as resp:
+def http_get(path, base=None):
+    with urllib.request.urlopen((base or BASE_URL) + path, timeout=10) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def wait_healthy():
+def wait_healthy(base=None):
     deadline = time.time() + HEALTH_TIMEOUT
     last = None
     while time.time() < deadline:
         try:
-            status, body = http_get("/healthz")
+            status, body = http_get("/healthz", base=base)
             if status == 200 and body.get("status") == "ok":
-                print(f"    PASS: 健康检查 200 {body}")
+                print(f"    PASS: 健康检查 200 {body}（{base or BASE_URL}）")
                 return True
         except Exception as exc:  # noqa: BLE001
             last = exc
         time.sleep(0.5)
-    print(f"    FAIL: 健康检查超时（{HEALTH_TIMEOUT}s）：{last}")
+    print(f"    FAIL: 健康检查超时（{HEALTH_TIMEOUT}s，{base or BASE_URL}）：{last}")
     failures.append("health")
     return False
+
+
+def _docker_available():
+    try:
+        subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _sh(args, check=True):
+    return subprocess.run(args, text=True, capture_output=True, check=check)
+
+
+def _container_ip(cid, net):
+    template = '{{(index .NetworkSettings.Networks "%s").IPAddress}}' % net
+    out = _sh(["docker", "inspect", "-f", template, cid])
+    return out.stdout.strip()
+
+
+def _start_shared_peers_docker(run_id):
+    """Start two arbiter containers on one fresh shared volume."""
+    image = "forest-arbiter:local"
+    volume = f"verify-shared-{run_id}"
+    network = f"verify-net-{run_id}"
+    name_a, name_b = f"verify-a-{run_id}", f"verify-b-{run_id}"
+    for cid in (name_a, name_b):
+        _sh(["docker", "rm", "-f", cid], check=False)
+    _sh(["docker", "volume", "create", volume])
+    _sh(["docker", "network", "create", network], check=False)
+    created = {"volume": volume, "network": network,
+               "containers": [name_a, name_b]}
+    try:
+        for name in (name_a, name_b):
+            _sh(["docker", "run", "-d", "--name", name,
+                 "--network", network,
+                 "-e", "ARBITER_HOST=0.0.0.0", "-e", "ARBITER_PORT=8080",
+                 "-e", "ARBITER_STORE=/data/sealed.json",
+                 "-v", f"{volume}:/data", image])
+        ip_a = _container_ip(name_a, network)
+        ip_b = _container_ip(name_b, network)
+        created["base_a"] = f"http://{ip_a}:8080"
+        created["base_b"] = f"http://{ip_b}:8080"
+    except Exception:
+        _cleanup_shared_peers_docker(created)
+        raise
+    return created
+
+
+def _cleanup_shared_peers_docker(created):
+    for cid in created.get("containers", []):
+        _sh(["docker", "rm", "-f", cid], check=False)
+    if created.get("network"):
+        _sh(["docker", "network", "rm", created["network"]], check=False)
+    if created.get("volume"):
+        _sh(["docker", "volume", "rm", created["volume"]], check=False)
+
+
+def _start_shared_peers_local():
+    """Local fallback: two service subprocesses sharing one store file."""
+    data_dir = tempfile.mkdtemp(prefix="arbiter-shared-")
+    store = os.path.join(data_dir, "sealed.json")
+    procs = []
+    logfiles = []
+    bases = []
+    for port in (18081, 18082):
+        log = open(os.path.join(data_dir, f"arbiter-{port}.log"), "w",
+                   encoding="utf-8")
+        env = dict(os.environ, ARBITER_HOST="127.0.0.1",
+                   ARBITER_PORT=str(port), ARBITER_STORE=store)
+        procs.append(subprocess.Popen(
+            [sys.executable, "-m", "app.service"],
+            stdout=log, stderr=subprocess.STDOUT, env=env))
+        logfiles.append(log)
+        bases.append(f"http://127.0.0.1:{port}")
+    return {"bases": bases, "procs": procs, "logs": logfiles}
+
+
+def _cleanup_shared_peers_local(created):
+    for proc in created.get("procs", []):
+        proc.terminate()
+    for proc in created.get("procs", []):
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    for log in created.get("logs", []):
+        log.close()
+
+
+def shared_volume_scenario(run_id):
+    """Two initialized instances sharing one sealed.json must not duplicate-seal."""
+    use_docker = _docker_available()
+    created = None
+    try:
+        if use_docker:
+            print("    （Docker 可用：启动共享同一数据卷的两个 arbiter 容器）")
+            created = _start_shared_peers_docker(run_id)
+            base_a, base_b = created["base_a"], created["base_b"]
+        elif os.environ.get("ALLOW_LOCAL_FALLBACK") == "1":
+            print("    （Docker 不可用：本地启动共享同一封存文件的两个子进程）")
+            created = _start_shared_peers_local()
+            base_a, base_b = created["bases"]
+        else:
+            print("    SKIP: Docker 不可用且未设置 ALLOW_LOCAL_FALLBACK=1，"
+                  "跳过共享卷双实例场景")
+            return
+
+        if not wait_healthy(base_a) or not wait_healthy(base_b):
+            return
+
+        aid = f"verify-shared-{run_id}"
+        first = {
+            "audit_id": aid, "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["a"]}],
+            "start": "S", "tokens": ["a"],
+        }
+        # Instance A seals the first evidence.
+        status, body = http_post("/api/v1/analyze", first, base=base_a)
+        check(status == 200 and body.get("seal_status") == "SEALED",
+              f"实例 A 首份审计封存 SEALED（实际 HTTP {status} "
+              f"{body.get('seal_status')}）")
+        check(body.get("result", {}).get("production_sequence") == [1],
+              "A 的结论为 S->a 派生（产生式 [1]）")
+
+        # Instance B, sharing the volume but initialized before the seal,
+        # submits semantically different evidence under the same id.
+        other = {
+            "audit_id": aid, "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["b"]}],
+            "start": "S", "tokens": ["b"],
+        }
+        status, body = http_post("/api/v1/analyze", other, base=base_b)
+        check(status == 409 and body.get("error") == "AUDIT_ID_CONFLICT",
+              f"实例 B 同标识不同语义提交返回 AUDIT_ID_CONFLICT "
+              f"（实际 HTTP {status} {body.get('error')}）")
+        orig = body.get("original_evidence", {}).get("conclusion", {})
+        check(orig.get("production_sequence") == [1]
+              and orig.get("tree", {}).get("children", [{}])[0]
+                  .get("token") == "a",
+              "冲突响应回传的仍是 A 的首份证据")
+
+        # Rereading by id from BOTH instances must keep yielding A.
+        for label, base in (("A", base_a), ("B", base_b)):
+            s, b = http_get(f"/api/v1/conclusion/{aid}", base=base)
+            conclusion = b.get("conclusion", {})
+            token = (conclusion.get("tree", {}).get("children", [{}])[0]
+                     .get("token"))
+            check(s == 200 and token == "a"
+                  and conclusion.get("production_sequence") == [1],
+                  f"从实例 {label} 重新读取仍为 A 的首份证据（token a，实际 "
+                  f"HTTP {s} token={token}）")
+
+        # B can still replay A's evidence with an equivalent submission.
+        status, body = http_post("/api/v1/analyze", first, base=base_b)
+        check(status == 200 and body.get("seal_status") == "REPLAYED",
+              f"实例 B 语义等价重放回放 A 的证据 REPLAYED（实际 HTTP {status} "
+              f"{body.get('seal_status')}）")
+    finally:
+        if created is not None:
+            if use_docker:
+                _cleanup_shared_peers_docker(created)
+            else:
+                _cleanup_shared_peers_local(created)
 
 
 def main() -> int:
@@ -209,6 +378,9 @@ def main() -> int:
     check("无限" in rej.get("detail", "") or "循环" in rej.get("detail", ""),
           "给出首个可操作中文原因")
 
+    step("步骤 4：共享封存卷的两个实例不得重复封存（首份证据优先）")
+    shared_volume_scenario(run_id)
+
     return report()
 
 
@@ -220,7 +392,8 @@ def report() -> int:
             print(f"  - {f}")
         print("RESULT: FAIL")
         return 1
-    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / 冲突")
+    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / "
+          "冲突 / 共享卷双实例首份证据优先")
     print("RESULT: PASS")
     return 0
 

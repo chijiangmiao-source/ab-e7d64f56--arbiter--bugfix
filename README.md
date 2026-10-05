@@ -32,6 +32,10 @@
 - 新审计标识：计算并封存结论（`SEALED`），落盘到 `/data/sealed.json`（原子替换）。
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
+- 多个 arbiter 实例（滚动发布、意外扩容）共享同一封存文件时，封存判定在跨进程文件锁
+  （`sealed.json.lock` 上的 `flock`）内重新读取磁盘后做出：**首份已封存证据永久优先**，
+  后到实例即使持有空文件时的旧快照，也只会得到冲突或回放，无法覆盖首份证据；
+  读取同样以共享文件为准。
 
 ## HTTP
 
@@ -80,7 +84,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 43 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
