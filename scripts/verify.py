@@ -9,7 +9,10 @@ Order of operations (mirrors the acceptance contract):
 3. HTTP smoke against the running arbiter:
    unique acceptance, ambiguous acceptance with two stable trees,
    non-consuming-cycle rejection, equivalent retransmission replay,
-   audit-id conflict preserving the original evidence.
+   audit-id conflict preserving the original evidence, and the
+   shared-volume case: a second initialized arbiter instance must
+   conflict on a distinct submission under the same id while the first
+   evidence stays readable from both instances.
 
 Exits 0 only when every step passes; any failure exits 1.
 """
@@ -26,6 +29,8 @@ import urllib.request
 import uuid
 
 BASE_URL = os.environ.get("ARBITER_BASE_URL", "http://127.0.0.1:8080")
+# Second arbiter instance sharing the same /data sealed volume.
+PEER_URL = os.environ.get("ARBITER_PEER_URL", BASE_URL)
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "30"))
 
 failures = []
@@ -43,10 +48,10 @@ def check(cond, msg):
         failures.append(msg)
 
 
-def http_post(path, payload):
+def http_post(path, payload, base_url=BASE_URL):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        BASE_URL + path, data=data,
+        base_url + path, data=data,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -55,24 +60,24 @@ def http_post(path, payload):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-def http_get(path):
-    with urllib.request.urlopen(BASE_URL + path, timeout=10) as resp:
+def http_get(path, base_url=BASE_URL):
+    with urllib.request.urlopen(base_url + path, timeout=10) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def wait_healthy():
+def wait_healthy(base_url=BASE_URL, label="arbiter"):
     deadline = time.time() + HEALTH_TIMEOUT
     last = None
     while time.time() < deadline:
         try:
-            status, body = http_get("/healthz")
+            status, body = http_get("/healthz", base_url)
             if status == 200 and body.get("status") == "ok":
-                print(f"    PASS: 健康检查 200 {body}")
+                print(f"    PASS: {label} 健康检查 200 {body}")
                 return True
         except Exception as exc:  # noqa: BLE001
             last = exc
         time.sleep(0.5)
-    print(f"    FAIL: 健康检查超时（{HEALTH_TIMEOUT}s）：{last}")
+    print(f"    FAIL: {label} 健康检查超时（{HEALTH_TIMEOUT}s）：{last}")
     failures.append("health")
     return False
 
@@ -90,7 +95,10 @@ def main() -> int:
             # Still report early; HTTP smoke is meaningless without engine.
             return report()
 
-    if not wait_healthy():
+    if not wait_healthy(BASE_URL, "arbiter A"):
+        return report()
+    peer_enabled = PEER_URL != BASE_URL
+    if peer_enabled and not wait_healthy(PEER_URL, "arbiter B（共享封存卷）"):
         return report()
 
     run_id = uuid.uuid4().hex[:8]
@@ -209,6 +217,59 @@ def main() -> int:
     check("无限" in rej.get("detail", "") or "循环" in rej.get("detail", ""),
           "给出首个可操作中文原因")
 
+    step("步骤 4：共享封存卷双实例——同标识不同语义必须冲突且首份证据可读")
+    if not peer_enabled:
+        print("    SKIP: 未配置 ARBITER_PEER_URL，跳过共享卷双实例回归")
+    else:
+        sid = f"shared-audit-{run_id}"
+
+        # Instance A seals S -> a / token a.
+        status, body = http_post("/api/v1/analyze", {
+            "audit_id": sid,
+            "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["a"]}],
+            "start": "S",
+            "tokens": ["a"],
+        }, BASE_URL)
+        check(status == 200 and body.get("seal_status") == "SEALED",
+              f"实例 A 首份审计封存 SEALED（实际 HTTP {status} {body.get('seal_status')}）")
+        res_a = body.get("result", {})
+        check(res_a.get("verdict") == "UNIQUE_ACCEPTED"
+              and res_a.get("production_sequence") == [1],
+              "A 封存结论为 S=>a 唯一接受")
+
+        # Instance B initialized on the empty shared file submits a
+        # semantically different audit under the same id: must conflict.
+        status, body = http_post("/api/v1/analyze", {
+            "audit_id": sid,
+            "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["b"]}],
+            "start": "S",
+            "tokens": ["b"],
+        }, PEER_URL)
+        check(status == 409 and body.get("error") == "AUDIT_ID_CONFLICT",
+              f"实例 B 同标识不同语义返回 AUDIT_ID_CONFLICT（实际 HTTP {status}）")
+        orig = body.get("original_evidence", {}).get("conclusion", {})
+        check(orig.get("production_sequence") == [1]
+              and orig.get("tree", {}).get("children", [{}])[0].get("token") == "a",
+              "冲突响应回传 A 的首份原始证据（token a），而非 B 的结论")
+
+        # Re-reading the id from B (the stale instance) yields A's
+        # evidence; B's conclusion must never replace it.
+        status, body = http_get(f"/api/v1/conclusion/{sid}", PEER_URL)
+        reread = body.get("conclusion", {})
+        check(status == 200
+              and reread.get("production_sequence") == [1]
+              and reread.get("tree", {}).get("children", [{}])[0].get("token") == "a",
+              f"从实例 B 重新读取仍为 A 的首份证据（实际 HTTP {status}）")
+
+        # And from A as well.
+        status, body = http_get(f"/api/v1/conclusion/{sid}", BASE_URL)
+        reread = body.get("conclusion", {})
+        check(status == 200
+              and reread.get("tree", {}).get("children", [{}])[0].get("token") == "a",
+              "从实例 A 重新读取首份证据持续可读")
+
     return report()
 
 
@@ -220,7 +281,7 @@ def report() -> int:
             print(f"  - {f}")
         print("RESULT: FAIL")
         return 1
-    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / 冲突")
+    print("全部步骤通过：单元测试 / 镜像 / 唯一 / 歧义 / 无消费环 / 回放 / 冲突 / 共享卷双实例")
     print("RESULT: PASS")
     return 0
 

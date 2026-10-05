@@ -32,6 +32,9 @@
 - 新审计标识：计算并封存结论（`SEALED`），落盘到 `/data/sealed.json`（原子替换）。
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
+- 多个实例可共享同一封存文件（滚动发布/意外扩容）：封存的检查-落盘临界区经 `fcntl`
+  文件锁串行化，且在锁内重读磁盘，因此即便两个实例都在文件为空时完成初始化，
+  同标识的第二份语义不同提交仍返回 `AUDIT_ID_CONFLICT`，首份证据永远不会被覆盖。
 
 ## HTTP
 
@@ -64,6 +67,7 @@
 ```bash
 # 自动先构建镜像、等待 arbiter 健康，再在 verify 内执行：
 # 单元测试 -> 显式镜像构建 -> 唯一/歧义/无消费环（含回放、冲突）HTTP 冒烟
+#             -> 共享封存卷双实例：同标识不同语义冲突且首份证据持续可读
 docker compose run --rm --build verify
 echo "verify 退出码：$?"
 ```
@@ -80,7 +84,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 42 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
@@ -90,7 +94,7 @@ ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整�
 ```
 app/grammar.py    请求结构校验（限制/非法符号/悬空引用/首个原因）
 app/engine.py     静态分析（可生成性、不消费词元循环）+ Earley/SPPF 构建 + 稳定选树
-app/storage.py    语义指纹、封存、回放、冲突保留
+app/storage.py    语义指纹、封存、回放、冲突保留（fcntl 跨进程锁，共享封存卷安全）
 app/service.py    HTTP 服务
 tests/            引擎/封存/HTTP 单元测试
 scripts/          verify.py（冒烟）与 entrypoint.sh（验收编排）

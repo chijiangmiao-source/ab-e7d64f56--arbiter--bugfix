@@ -50,6 +50,7 @@ class TestSealReplayConflict(unittest.TestCase):
         self.store = SealedStore(self.path)
 
     def tearDown(self):
+        self.store.close()
         self.tmp.cleanup()
 
     def test_seal_replay_conflict_keeps_original(self):
@@ -91,6 +92,76 @@ class TestSealReplayConflict(unittest.TestCase):
         got = store2.get("audit-A")
         self.assertIsNotNone(got)
         self.assertEqual(got["conclusion"]["verdict"], "UNIQUE_ACCEPTED")
+
+
+def payload_s(token):
+    return {
+        "audit_id": "shared-audit",
+        "start": "S",
+        "nonterminals": ["S"],
+        "productions": [{"id": 1, "lhs": "S", "rhs": [token]}],
+        "tokens": [token],
+    }
+
+
+class TestSharedVolumeInstances(unittest.TestCase):
+    """Two instances sharing one file must not overwrite each other.
+
+    Both stores finish initialization while the file is absent, exactly
+    like a rolling deployment / accidental scale-out against the same
+    empty sealed volume.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "sealed.json")
+        # Both initialized before any evidence exists on disk.
+        self.store_a = SealedStore(self.path)
+        self.store_b = SealedStore(self.path)
+
+    def tearDown(self):
+        self.store_a.close()
+        self.store_b.close()
+        self.tmp.cleanup()
+
+    def test_second_distinct_seal_conflicts_and_first_evidence_survives(self):
+        # A seals S -> a / tokens [a].
+        entry_a, status_a = self.store_a.submit(
+            "shared-audit", payload_s("a"),
+            lambda: {"verdict": "UNIQUE_ACCEPTED", "witness": "a"})
+        self.assertEqual(status_a, "SEALED")
+
+        # B never reloaded voluntarily; submit must detect A's seal via
+        # the shared file and refuse to seal S -> b / tokens [b].
+        with self.assertRaises(ConflictError) as ctx:
+            self.store_b.submit(
+                "shared-audit", payload_s("b"),
+                lambda: {"verdict": "UNIQUE_ACCEPTED", "witness": "b"})
+        self.assertEqual(
+            ctx.exception.existing["conclusion"]["witness"], "a")
+
+        # Re-reading the id from B (and a freshly opened third instance)
+        # always yields A's first evidence.
+        got_b = self.store_b.get("shared-audit")
+        self.assertIsNotNone(got_b)
+        self.assertEqual(got_b["conclusion"]["witness"], "a")
+        store_c = SealedStore(self.path)
+        got_c = store_c.get("shared-audit")
+        self.assertEqual(got_c["conclusion"]["witness"], "a")
+        store_c.close()
+
+        # B retransmitting A's semantics replays instead of sealing.
+        replay, status_r = self.store_b.submit(
+            "shared-audit", payload_s("a"),
+            lambda: self.fail("must not recompute on replay"))
+        self.assertEqual(status_r, "REPLAYED")
+        self.assertEqual(replay["conclusion"]["witness"], "a")
+
+        # The shared file itself contains A's evidence, never B's.
+        with open(self.path, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(
+            on_disk["shared-audit"]["conclusion"]["witness"], "a")
 
 
 if __name__ == "__main__":

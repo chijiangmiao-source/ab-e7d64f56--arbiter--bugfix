@@ -1,10 +1,14 @@
 # Compose for the deep-space lander grammar arbiter.
 #
-#   arbiter : the verdict service (configurable host port)
-#   verify  : one-shot acceptance; runs engine tests, builds the image,
-#             starts a sibling arbiter container, smokes the unique /
-#             ambiguous / non-consuming-cycle HTTP scenarios, exits
-#             with the aggregate status code.
+#   arbiter      : the verdict service (configurable host port)
+#   arbiter-peer : a second instance initialized against the same
+#                  (empty) shared sealed volume; exercises the
+#                  rolling-deploy / scale-out conflict regression
+#   verify       : one-shot acceptance; runs engine tests, builds the image,
+#                  starts a sibling arbiter container, smokes the unique /
+#                  ambiguous / non-consuming-cycle HTTP scenarios and the
+#                  shared-volume two-instance case, exits with the
+#                  aggregate status code.
 #
 # Host port configuration:
 #   ARBITER_HOST_PORT=9090 docker compose up --build
@@ -30,6 +34,28 @@ services:
       retries: 10
       start_period: 2s
 
+  # Second arbiter instance sharing the exact same sealed.json volume.
+  # It is started alongside the first one (no dependency), so both
+  # initialize while /data is empty -- the regression scenario.
+  arbiter-peer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: forest-arbiter:local
+    environment:
+      ARBITER_HOST: 0.0.0.0
+      ARBITER_PORT: "8080"
+      ARBITER_STORE: /data/sealed.json
+    volumes:
+      - arbiter-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
   verify:
     build:
       context: .
@@ -38,11 +64,14 @@ services:
     depends_on:
       arbiter:
         condition: service_healthy
+      arbiter-peer:
+        condition: service_healthy
     environment:
-      # When run inside Compose, talk to the healthy arbiter service;
+      # When run inside Compose, talk to the healthy arbiter services;
       # the entrypoint still independently builds the image and starts a
       # sibling container to satisfy the ordered acceptance contract.
       ARBITER_BASE_URL: "http://arbiter:8080"
+      ARBITER_PEER_URL: "http://arbiter-peer:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     # One-shot: run once and exit with the acceptance status code.

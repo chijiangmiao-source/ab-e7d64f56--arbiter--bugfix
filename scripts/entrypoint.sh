@@ -30,7 +30,12 @@ elif [ "${ALLOW_LOCAL_FALLBACK:-0}" = "1" ]; then
   mkdir -p /tmp/arbiter-data
   ARBITER_STORE=/tmp/arbiter-data/sealed.json ARBITER_PORT=18080 \
     python3 -m app.service >/tmp/arbiter.log 2>&1 &
+  # Second instance initialized against the same empty shared store:
+  # rolling-deploy / accidental scale-out regression scenario.
+  ARBITER_STORE=/tmp/arbiter-data/sealed.json ARBITER_PORT=18081 \
+    python3 -m app.service >/tmp/arbiter-peer.log 2>&1 &
   export ARBITER_BASE_URL="http://127.0.0.1:18080"
+  export ARBITER_PEER_URL="http://127.0.0.1:18081"
 else
   echo "无法连接 Docker daemon（/var/run/docker.sock），无法执行镜像构建" >&2
   exit 1

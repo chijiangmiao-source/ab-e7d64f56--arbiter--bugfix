@@ -13,8 +13,14 @@ fingerprint.  Rules:
                                   reported back alongside the new
                                   fingerprint.
 
-The store is a single JSON file replaced atomically; a process-wide lock
-serializes writes.  Sealed entries are immutable.
+The store is a single JSON file replaced atomically.  Multiple arbiter
+instances may share one file (rolling deployments, accidental scale-out);
+the on-disk file is therefore authoritative.  Every check-and-seal
+critical section takes an exclusive ``fcntl`` lock and re-reads the file
+inside it, so an instance that booted against an empty/absent file still
+observes evidence sealed concurrently by a peer -- the first sealed
+conclusion for an audit id can never be silently overwritten.  Writes
+merge the in-memory view with the freshly read peer entries.
 """
 
 from __future__ import annotations
@@ -23,8 +29,14 @@ import hashlib
 import json
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
+
+try:
+    import fcntl  # POSIX
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 class ConflictError(Exception):
@@ -70,29 +82,93 @@ class SealedStore:
         self._lock = threading.Lock()
         self._entries: Dict[str, dict] = {}
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        if os.path.exists(path):
+        # A separate lock file (never replaced) carries the fcntl lock
+        # across the atomic rename of the data file.
+        self._lock_path = os.path.abspath(path) + ".lock"
+        self._lock_fh = open(self._lock_path, "a+b")
+        self._entries = self._read_file()
+
+    # ------------------------------------------------------------------
+    # File-level primitives
+    # ------------------------------------------------------------------
+    def _read_file(self) -> Dict[str, dict]:
+        """Read and validate the current on-disk store.
+
+        A corrupt or truncated file (including a torn write observed by
+        another process) is quarantined rather than destroyed.  When the
+        file is temporarily unreadable the in-memory view is kept so
+        that existing evidence is not lost.
+        """
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError):
             try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if isinstance(data, dict):
-                    self._entries = data
-            except (json.JSONDecodeError, OSError):
-                # Corrupt store: quarantine rather than destroy evidence.
-                qpath = path + ".corrupt." + datetime.now(timezone.utc).strftime(
+                qpath = self.path + ".corrupt." + datetime.now(timezone.utc).strftime(
                     "%Y%m%dT%H%M%SZ"
                 )
-                os.replace(path, qpath)
-                self._entries = {}
+                os.replace(self.path, qpath)
+            except OSError:
+                pass
+            return {}
+        if isinstance(data, dict):
+            return data
+        return {}
 
-    def _persist_locked(self) -> None:
+    @contextmanager
+    def _file_lock(self, exclusive: bool) -> Iterator[None]:
+        """Cross-process lock; re-entrant per thread.
+
+        Combined with the in-process :data:`_lock` it serializes both
+        threads of one instance and separate instances sharing the file.
+        """
+        self._lock.acquire()
+        if fcntl is not None:
+            flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(self._lock_fh.fileno(), flags)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+            self._lock.release()
+
+    def _persist_locked(self, entries: Dict[str, dict]) -> None:
+        """Atomically replace the data file with ``entries``."""
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self._entries, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(entries, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self.path)
 
+    def _refresh_locked(self) -> Dict[str, dict]:
+        """Re-read the shared file and merge it into the local view.
+
+        Sealing is first-writer-wins, so on any id present in both
+        views the on-disk entry takes precedence; locally known ids the
+        file does not contain are kept (they belong to this instance
+        and are about to be written back).
+        """
+        on_disk = self._read_file()
+        merged = dict(self._entries)
+        merged.update(on_disk)
+        self._entries = merged
+        return merged
+
+    def close(self) -> None:
+        """Release the cross-process lock handle."""
+        self._lock_fh.close()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def get(self, audit_id: str) -> Optional[dict]:
-        with self._lock:
-            entry = self._entries.get(audit_id)
+        with self._file_lock(exclusive=False):
+            entries = self._refresh_locked()
+            entry = entries.get(audit_id)
             return json.loads(json.dumps(entry)) if entry else None
 
     def submit(
@@ -101,14 +177,19 @@ class SealedStore:
         """Seal/replay a submission.
 
         ``compute_conclusion`` is called with no arguments only for a
-        genuinely new id and must return a JSON-serializable conclusion.
-        Returns ``(envelope, status)`` where status is ``SEALED`` or
+        genuinely new id (visible to no sharing instance) and must
+        return a JSON-serializable conclusion.  Returns
+        ``(envelope, status)`` where status is ``SEALED`` or
         ``REPLAYED``; raises :class:`ConflictError` on id reuse with
-        different semantics.
+        different semantics -- including reuse first observed through a
+        peer instance's concurrent seal.
         """
         incoming_hash, canonical = canonical_fingerprint(payload)
-        with self._lock:
-            existing = self._entries.get(audit_id)
+        with self._file_lock(exclusive=True):
+            # The file is authoritative: a peer may have sealed this id
+            # after this instance last looked.
+            entries = self._refresh_locked()
+            existing = entries.get(audit_id)
             if existing is not None:
                 if existing["request_hash"] == incoming_hash:
                     return json.loads(json.dumps(existing)), "REPLAYED"
@@ -131,6 +212,7 @@ class SealedStore:
                 .replace("+00:00", "Z"),
                 "conclusion": conclusion,
             }
-            self._entries[audit_id] = entry
-            self._persist_locked()
+            entries[audit_id] = entry
+            self._persist_locked(entries)
+            self._entries = entries
             return json.loads(json.dumps(entry)), "SEALED"
